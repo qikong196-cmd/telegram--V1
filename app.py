@@ -1,7 +1,15 @@
 import os
+import time
 import logging
+from collections import defaultdict, deque
+
 from fastapi import FastAPI, Request, Response
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,297 +20,351 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]  # 例如：@ai_r444
+REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]
+
+# 关键词黑名单，用英文逗号分隔
+# 例如：菠菜,兼职,日结,担保,代付,外围,送彩金,客服飞机
+BLACKLIST_KEYWORDS = [
+    x.strip().lower()
+    for x in os.environ.get("BLACKLIST_KEYWORDS", "").split(",")
+    if x.strip()
+]
+
+# 白名单用户ID，用英文逗号分隔
+# 例如：123456789,987654321
+WHITELIST_USER_IDS = {
+    int(x.strip())
+    for x in os.environ.get("WHITELIST_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+# 防刷配置
+RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))
+FLOOD_MUTE_SECONDS = int(os.environ.get("FLOOD_MUTE_SECONDS", "300"))
 
 bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 app = FastAPI()
 
+# 每个用户的验证消息，只保留一条
+VERIFY_MSG = defaultdict(set)
+
+# 用户发言时间记录
+USER_MESSAGE_LOGS = defaultdict(deque)
+
 
 # ===== 工具函数 =====
 
-def is_group_chat(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.type in ("group", "supergroup"))
-
-
 def get_verify_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("先去关注频道", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}")],
-            [InlineKeyboardButton("我已关注，点击解禁", callback_data="verify_subscription")],
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👉 关注频道", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}")],
+        [InlineKeyboardButton("✅ 已关注，点击解禁", callback_data="verify_subscription")]
+    ])
 
 
-async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+def get_message_text(update: Update) -> str:
+    if not update.message:
+        return ""
+    text = update.message.text or ""
+    caption = update.message.caption or ""
+    return f"{text}\n{caption}".strip().lower()
+
+
+def is_whitelisted(user_id: int) -> bool:
+    return user_id in WHITELIST_USER_IDS
+
+
+def contains_ad_keywords(text: str) -> bool:
+    if not text:
+        return False
+
+    for kw in BLACKLIST_KEYWORDS:
+        if kw and kw in text:
+            return True
+
+    common_spam_patterns = [
+        "http://", "https://", "t.me/", "@", "wx", "vx",
+        "飞机", "电报联系", "私聊", "加我", "担保", "代付",
+        "日结", "兼职", "返利", "代理", "推广"
+    ]
+    return any(p in text for p in common_spam_patterns)
+
+
+async def delete_user_message(update: Update):
+    if update.message:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+async def safe_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
     try:
-        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ("member", "administrator", "creator", "owner")
+        await context.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+
+async def is_sub(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
+    try:
+        m = await context.bot.get_chat_member(REQUIRED_CHANNEL, uid)
+        return m.status in ("member", "administrator", "creator", "owner")
     except Exception as e:
-        logger.warning("检查频道订阅失败: %s", e)
+        logger.warning("频道检查失败: %s", e)
         return False
 
 
-async def mute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+async def mute(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
     await context.bot.restrict_chat_member(
-        chat_id=chat_id,
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=False,
-            can_send_audios=False,
-            can_send_documents=False,
-            can_send_photos=False,
-            can_send_videos=False,
-            can_send_video_notes=False,
-            can_send_voice_notes=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-            can_manage_topics=False,
-        ),
+        cid,
+        uid,
+        ChatPermissions(can_send_messages=False),
     )
 
 
-async def unmute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+async def mute_for_seconds(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int, seconds: int):
+    until_date = int(time.time()) + seconds
     await context.bot.restrict_chat_member(
-        chat_id=chat_id,
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-            can_manage_topics=False,
-        ),
+        cid,
+        uid,
+        ChatPermissions(can_send_messages=False),
+        until_date=until_date,
     )
 
 
-async def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+async def unmute(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
+    await context.bot.restrict_chat_member(
+        cid,
+        uid,
+        ChatPermissions(can_send_messages=True),
+    )
+
+
+async def ban_user(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
+    await context.bot.ban_chat_member(cid, uid)
+
+
+async def is_admin(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int) -> bool:
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator", "owner")
+        m = await context.bot.get_chat_member(cid, uid)
+        return m.status in ("administrator", "creator", "owner")
     except Exception:
         return False
 
 
-# ===== 指令 =====
+async def send_temp_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, seconds: int = 5):
+    try:
+        msg = await context.bot.send_message(chat_id, text)
+        await context.application.create_task(_delete_later(context, chat_id, msg.message_id, seconds))
+    except Exception:
+        pass
+
+
+async def _delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, seconds: int):
+    import asyncio
+    await asyncio.sleep(seconds)
+    await safe_delete(context, chat_id, msg_id)
+
+
+async def send_verify(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
+    # 删除旧验证消息，只保留 1 条
+    for mid in VERIFY_MSG[(cid, user.id)]:
+        await safe_delete(context, cid, mid)
+    VERIFY_MSG[(cid, user.id)].clear()
+
+    msg = await context.bot.send_message(
+        cid,
+        f"请先关注频道：{REQUIRED_CHANNEL}",
+        reply_markup=get_verify_keyboard(),
+    )
+    VERIFY_MSG[(cid, user.id)].add(msg.message_id)
+
+
+async def clear_verify(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
+    for mid in VERIFY_MSG[(cid, uid)]:
+        await safe_delete(context, cid, mid)
+    VERIFY_MSG.pop((cid, uid), None)
+
+
+def hit_rate_limit(chat_id: int, user_id: int) -> bool:
+    now = time.time()
+    q = USER_MESSAGE_LOGS[(chat_id, user_id)]
+
+    while q and now - q[0] > RATE_LIMIT_WINDOW:
+        q.popleft()
+
+    q.append(now)
+    return len(q) > RATE_LIMIT_COUNT
+
+
+# ===== 指令（隐藏） =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text("机器人已启动 ✅")
+    await delete_user_message(update)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "可用指令：\n"
-            "/start - 启动机器人\n"
-            "/help - 查看帮助\n"
-            "/rules - 查看群规\n"
-            "/verify - 手动验证频道关注并解禁\n\n"
-            "关键词：资源 / 客服"
-        )
+    await delete_user_message(update)
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "群规：\n"
-            "1. 禁止广告\n"
-            "2. 禁止私聊拉人\n"
-            "3. 禁止刷屏\n"
-            "4. 进群后需先关注指定频道\n"
-            "5. 违规将处理"
-        )
+    await delete_user_message(update)
 
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_user_message(update)
+
     if not update.effective_user or not update.effective_chat:
         return
 
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    subscribed = await is_user_subscribed(context, user.id)
+    u = update.effective_user
+    cid = update.effective_chat.id
 
-    if subscribed:
-        await unmute_user(context, chat_id, user.id)
-        if update.message:
-            await update.message.reply_text(f"{user.first_name} ✅ 验证成功，已解除禁言。")
-    else:
-        if update.message:
-            await update.message.reply_text(
-                f"你还没有关注频道：{REQUIRED_CHANNEL}\n"
-                "请先关注，再发送 /verify",
-                reply_markup=get_verify_keyboard(),
-            )
+    if await is_sub(context, u.id):
+        await unmute(context, cid, u.id)
+        await clear_verify(context, cid, u.id)
 
 
 # ===== 按钮验证 =====
 
 async def verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
+    q = update.callback_query
+    if not q or not q.message:
         return
 
-    await query.answer()
+    await q.answer()
 
-    user = query.from_user
-    chat = query.message.chat if query.message else None
-    if not chat:
-        return
+    u = q.from_user
+    cid = q.message.chat.id
 
-    subscribed = await is_user_subscribed(context, user.id)
+    if await is_sub(context, u.id):
+        await unmute(context, cid, u.id)
 
-    if subscribed:
-        await unmute_user(context, chat.id, user.id)
-        await query.message.reply_text(f"{user.first_name} ✅ 已确认关注频道，已解除禁言。")
-    else:
-        await query.answer("你还没有关注频道，请先关注后再点。", show_alert=True)
-
-
-# ===== 关键词回复 =====
-
-async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-
-    if "资源" in text:
-        await update.message.reply_text("资源入口稍后补上（这里替换成你的链接）")
-    elif "客服" in text:
-        await update.message.reply_text("如需帮助，请联系管理员。")
-
-
-# ===== 欢迎 =====
-
-async def send_welcome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user):
-    subscribed = await is_user_subscribed(context, user.id)
-
-    if not subscribed:
         try:
-            await mute_user(context, chat_id, user.id)
-        except Exception as e:
-            logger.warning("禁言失败: %s", e)
+            await q.message.delete()
+        except Exception:
+            pass
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"欢迎 {user.first_name} 🔥\n\n"
-                f"请先关注频道：{REQUIRED_CHANNEL}\n"
-                "关注后点击下方按钮即可自动解禁。"
-            ),
-            reply_markup=get_verify_keyboard(),
-        )
+        await clear_verify(context, cid, u.id)
+        await q.answer("已解禁", show_alert=False)
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"欢迎 {user.first_name} 🔥\n\n"
-                "你已通过频道检查，可以正常发言。\n"
-                "请先查看群规 /rules"
-            ),
-        )
+        await q.answer("请先关注频道", show_alert=True)
 
 
-async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
-        return
+# ===== 新人入群 =====
 
-    logger.info("收到 new_chat_members")
-
-    for user in update.message.new_chat_members:
-        if user.is_bot:
-            continue
-        await send_welcome(context, update.effective_chat.id, user)
-
-
-async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.chat_member:
-        return
-
-    logger.info("收到 chat_member 事件")
-
-    old_status = update.chat_member.old_chat_member.status
-    new_status = update.chat_member.new_chat_member.status
-    user = update.chat_member.new_chat_member.user
-    chat_id = update.chat_member.chat.id
-
-    joined = old_status in ("left", "kicked") and new_status in (
-        "member",
-        "administrator",
-        "restricted",
-    )
-
-    if joined and not user.is_bot:
-        await send_welcome(context, chat_id, user)
-
-
-# ===== 未关注频道时拦截发言 =====
-
-async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user or not update.effective_chat:
-        return
-
-    if not is_group_chat(update):
-        return
-
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-
+async def handle_new_user(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
     if user.is_bot:
         return
 
-    if await is_admin(context, chat_id, user.id):
+    if is_whitelisted(user.id):
         return
 
-    subscribed = await is_user_subscribed(context, user.id)
-
-    if subscribed:
+    if await is_sub(context, user.id):
         return
 
+    await mute(context, cid, user.id)
+    await send_verify(context, cid, user)
+
+
+async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    # 删除系统入群消息
     try:
         await update.message.delete()
-    except Exception as e:
-        logger.warning("删除消息失败: %s", e)
+    except Exception:
+        pass
 
-    try:
-        await mute_user(context, chat_id, user.id)
-    except Exception as e:
-        logger.warning("禁言失败: %s", e)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"{user.first_name} ❌ 你还没有关注频道\n"
-            f"👉 请先加入：{REQUIRED_CHANNEL}\n"
-            "关注后点击按钮即可自动解禁"
-        ),
-        reply_markup=get_verify_keyboard(),
-    )
+    for u in update.message.new_chat_members:
+        await handle_new_user(context, update.effective_chat.id, u)
 
 
-# ===== 注册 handler =====
+async def chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.chat_member:
+        return
+
+    old = update.chat_member.old_chat_member.status
+    new = update.chat_member.new_chat_member.status
+    u = update.chat_member.new_chat_member.user
+    cid = update.chat_member.chat.id
+
+    if old in ("left", "kicked") and new in ("member", "restricted", "administrator"):
+        await handle_new_user(context, cid, u)
+
+
+# ===== 主风控：频道验证 + 广告 + 防刷 =====
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+
+    u = update.effective_user
+    cid = update.effective_chat.id
+
+    if u.is_bot:
+        return
+
+    if is_whitelisted(u.id):
+        return
+
+    if await is_admin(context, cid, u.id):
+        return
+
+    # 1. 未关注频道
+    if not await is_sub(context, u.id):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        await mute(context, cid, u.id)
+        await send_verify(context, cid, u)
+        return
+
+    # 已关注后，清掉旧验证消息
+    await clear_verify(context, cid, u.id)
+
+    # 2. 防广告
+    text = get_message_text(update)
+    if contains_ad_keywords(text):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        try:
+            await ban_user(context, cid, u.id)
+        except Exception as e:
+            logger.warning("封禁失败: %s", e)
+
+        await send_temp_text(context, cid, "已处理违规广告账号。", 5)
+        return
+
+    # 3. 防刷屏
+    if hit_rate_limit(cid, u.id):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        try:
+            await mute_for_seconds(context, cid, u.id, FLOOD_MUTE_SECONDS)
+        except Exception as e:
+            logger.warning("限速禁言失败: %s", e)
+
+        await send_temp_text(context, cid, "发言过快，已临时限制。", 5)
+        return
+
+
+# ===== 注册 handlers =====
 
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
@@ -311,20 +373,13 @@ bot_app.add_handler(CommandHandler("verify", verify))
 
 bot_app.add_handler(CallbackQueryHandler(verify_button, pattern="^verify_subscription$"))
 
-bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
-bot_app.add_handler(ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER))
+bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member))
+bot_app.add_handler(ChatMemberHandler(chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-bot_app.add_handler(
-    MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
-        block_unsubscribed_messages,
-    )
-)
-
-bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, keyword_reply))
+bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, guard))
 
 
-# ===== 启动 =====
+# ===== 启动 / 关闭 =====
 
 @app.on_event("startup")
 async def startup():
@@ -341,15 +396,24 @@ async def startup():
     logger.info("Webhook 已设置成功")
 
 
-# ===== 关闭 =====
-
 @app.on_event("shutdown")
 async def shutdown():
     await bot_app.stop()
     await bot_app.shutdown()
 
 
-# ===== 健康检查 =====
+# ===== Webhook =====
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return {"ok": False}
+
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
+    return {"ok": True}
+
 
 @app.get("/")
 async def home():
@@ -359,18 +423,3 @@ async def home():
 @app.head("/")
 async def head():
     return Response(status_code=200)
-
-
-# ===== webhook 接收 =====
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return {"ok": False, "error": "invalid secret"}
-
-    data = await request.json()
-    update = Update.de_json(data, bot_app.bot)
-
-    logger.info("收到 update")
-    await bot_app.process_update(update)
-    return {"ok": True}
