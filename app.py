@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 from collections import defaultdict, deque
 
@@ -20,15 +21,18 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]
+REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]  # 例如 @ai_r444
 
-# 关键词黑名单，用英文逗号分隔
+# 黑名单关键词：英文逗号分隔
 # 例如：菠菜,兼职,日结,担保,代付,外围,送彩金,客服飞机
 BLACKLIST_KEYWORDS = [
     x.strip().lower()
@@ -36,7 +40,7 @@ BLACKLIST_KEYWORDS = [
     if x.strip()
 ]
 
-# 白名单用户ID，用英文逗号分隔
+# 白名单用户ID：英文逗号分隔
 # 例如：123456789,987654321
 WHITELIST_USER_IDS = {
     int(x.strip())
@@ -45,17 +49,17 @@ WHITELIST_USER_IDS = {
 }
 
 # 防刷配置
-RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))
-RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))
-FLOOD_MUTE_SECONDS = int(os.environ.get("FLOOD_MUTE_SECONDS", "300"))
+RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))       # 时间窗内最多消息数
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))    # 时间窗秒数
+FLOOD_MUTE_SECONDS = int(os.environ.get("FLOOD_MUTE_SECONDS", "300")) # 超频禁言秒数
 
 bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 app = FastAPI()
 
-# 每个用户的验证消息，只保留一条
+# 每个用户在群里的验证消息，只保留一条
 VERIFY_MSG = defaultdict(set)
 
-# 用户发言时间记录
+# 每个用户发言频率记录
 USER_MESSAGE_LOGS = defaultdict(deque)
 
 
@@ -84,14 +88,20 @@ def contains_ad_keywords(text: str) -> bool:
     if not text:
         return False
 
+    # 自定义黑词
     for kw in BLACKLIST_KEYWORDS:
         if kw and kw in text:
             return True
 
+    # 内置常见广告/引流模式
     common_spam_patterns = [
-        "http://", "https://", "t.me/", "@", "wx", "vx",
-        "飞机", "电报联系", "私聊", "加我", "担保", "代付",
-        "日结", "兼职", "返利", "代理", "推广"
+        "http://", "https://", "t.me/", "@",
+        "wx", "vx", "飞机", "电报联系",
+        "私聊", "加我", "联系我",
+        "担保", "代付", "日结", "兼职",
+        "返利", "代理", "推广", "合作",
+        "客服", "咨询", "外围", "彩票",
+        "菠菜", "担保群", "出入款", "通道"
     ]
     return any(p in text for p in common_spam_patterns)
 
@@ -111,12 +121,25 @@ async def safe_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: 
         pass
 
 
+async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, seconds: int = 5):
+    await asyncio.sleep(seconds)
+    await safe_delete(context, chat_id, msg_id)
+
+
+async def send_temp_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, seconds: int = 5):
+    try:
+        msg = await context.bot.send_message(chat_id, text)
+        context.application.create_task(delete_later(context, chat_id, msg.message_id, seconds))
+    except Exception:
+        pass
+
+
 async def is_sub(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
     try:
-        m = await context.bot.get_chat_member(REQUIRED_CHANNEL, uid)
-        return m.status in ("member", "administrator", "creator", "owner")
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, uid)
+        return member.status in ("member", "administrator", "creator", "owner")
     except Exception as e:
-        logger.warning("频道检查失败: %s", e)
+        logger.warning("频道检查失败 uid=%s err=%s", uid, e)
         return False
 
 
@@ -152,28 +175,14 @@ async def ban_user(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
 
 async def is_admin(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int) -> bool:
     try:
-        m = await context.bot.get_chat_member(cid, uid)
-        return m.status in ("administrator", "creator", "owner")
+        member = await context.bot.get_chat_member(cid, uid)
+        return member.status in ("administrator", "creator", "owner")
     except Exception:
         return False
 
 
-async def send_temp_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, seconds: int = 5):
-    try:
-        msg = await context.bot.send_message(chat_id, text)
-        await context.application.create_task(_delete_later(context, chat_id, msg.message_id, seconds))
-    except Exception:
-        pass
-
-
-async def _delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, seconds: int):
-    import asyncio
-    await asyncio.sleep(seconds)
-    await safe_delete(context, chat_id, msg_id)
-
-
 async def send_verify(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
-    # 删除旧验证消息，只保留 1 条
+    # 删除旧验证消息，只保留一条
     for mid in VERIFY_MSG[(cid, user.id)]:
         await safe_delete(context, cid, mid)
     VERIFY_MSG[(cid, user.id)].clear()
@@ -203,7 +212,7 @@ def hit_rate_limit(chat_id: int, user_id: int) -> bool:
     return len(q) > RATE_LIMIT_COUNT
 
 
-# ===== 指令（隐藏） =====
+# ===== 指令（全部隐藏） =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_user_message(update)
@@ -223,38 +232,38 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_chat:
         return
 
-    u = update.effective_user
+    user = update.effective_user
     cid = update.effective_chat.id
 
-    if await is_sub(context, u.id):
-        await unmute(context, cid, u.id)
-        await clear_verify(context, cid, u.id)
+    if await is_sub(context, user.id):
+        await unmute(context, cid, user.id)
+        await clear_verify(context, cid, user.id)
 
 
 # ===== 按钮验证 =====
 
 async def verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.message:
+    query = update.callback_query
+    if not query or not query.message:
         return
 
-    await q.answer()
+    await query.answer()
 
-    u = q.from_user
-    cid = q.message.chat.id
+    user = query.from_user
+    cid = query.message.chat.id
 
-    if await is_sub(context, u.id):
-        await unmute(context, cid, u.id)
+    if await is_sub(context, user.id):
+        await unmute(context, cid, user.id)
 
         try:
-            await q.message.delete()
+            await query.message.delete()
         except Exception:
             pass
 
-        await clear_verify(context, cid, u.id)
-        await q.answer("已解禁", show_alert=False)
+        await clear_verify(context, cid, user.id)
+        await query.answer("已解禁", show_alert=False)
     else:
-        await q.answer("请先关注频道", show_alert=True)
+        await query.answer("请先关注频道", show_alert=True)
 
 
 # ===== 新人入群 =====
@@ -266,9 +275,11 @@ async def handle_new_user(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
     if is_whitelisted(user.id):
         return
 
+    # 已在频道中，不处理
     if await is_sub(context, user.id):
         return
 
+    # 未关注：先禁言，再发验证
     await mute(context, cid, user.id)
     await send_verify(context, cid, user)
 
@@ -277,60 +288,61 @@ async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    # 删除系统入群消息
+    # 删掉 Telegram 的入群系统消息
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    for u in update.message.new_chat_members:
-        await handle_new_user(context, update.effective_chat.id, u)
+    for user in update.message.new_chat_members:
+        await handle_new_user(context, update.effective_chat.id, user)
 
 
 async def chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.chat_member:
         return
 
-    old = update.chat_member.old_chat_member.status
-    new = update.chat_member.new_chat_member.status
-    u = update.chat_member.new_chat_member.user
+    old_status = update.chat_member.old_chat_member.status
+    new_status = update.chat_member.new_chat_member.status
+    user = update.chat_member.new_chat_member.user
     cid = update.chat_member.chat.id
 
-    if old in ("left", "kicked") and new in ("member", "restricted", "administrator"):
-        await handle_new_user(context, cid, u)
+    # 新成员加入
+    if old_status in ("left", "kicked") and new_status in ("member", "restricted", "administrator"):
+        await handle_new_user(context, cid, user)
 
 
-# ===== 主风控：频道验证 + 广告 + 防刷 =====
+# ===== 主风控：公开入口补漏 + 广告 + 防刷 =====
 
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or not update.effective_chat:
         return
 
-    u = update.effective_user
+    user = update.effective_user
     cid = update.effective_chat.id
 
-    if u.is_bot:
+    if user.is_bot:
         return
 
-    if is_whitelisted(u.id):
+    if is_whitelisted(user.id):
         return
 
-    if await is_admin(context, cid, u.id):
+    if await is_admin(context, cid, user.id):
         return
 
-    # 1. 未关注频道
-    if not await is_sub(context, u.id):
+    # 1. 发言触发强制频道验证（补公开群入口的漏）
+    if not await is_sub(context, user.id):
         try:
             await update.message.delete()
         except Exception:
             pass
 
-        await mute(context, cid, u.id)
-        await send_verify(context, cid, u)
+        await mute(context, cid, user.id)
+        await send_verify(context, cid, user)
         return
 
-    # 已关注后，清掉旧验证消息
-    await clear_verify(context, cid, u.id)
+    # 用户已关注频道，清理旧验证消息
+    await clear_verify(context, cid, user.id)
 
     # 2. 防广告
     text = get_message_text(update)
@@ -341,24 +353,24 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         try:
-            await ban_user(context, cid, u.id)
+            await ban_user(context, cid, user.id)
         except Exception as e:
-            logger.warning("封禁失败: %s", e)
+            logger.warning("封禁失败 uid=%s err=%s", user.id, e)
 
         await send_temp_text(context, cid, "已处理违规广告账号。", 5)
         return
 
     # 3. 防刷屏
-    if hit_rate_limit(cid, u.id):
+    if hit_rate_limit(cid, user.id):
         try:
             await update.message.delete()
         except Exception:
             pass
 
         try:
-            await mute_for_seconds(context, cid, u.id, FLOOD_MUTE_SECONDS)
+            await mute_for_seconds(context, cid, user.id, FLOOD_MUTE_SECONDS)
         except Exception as e:
-            logger.warning("限速禁言失败: %s", e)
+            logger.warning("限速禁言失败 uid=%s err=%s", user.id, e)
 
         await send_temp_text(context, cid, "发言过快，已临时限制。", 5)
         return
@@ -376,6 +388,7 @@ bot_app.add_handler(CallbackQueryHandler(verify_button, pattern="^verify_subscri
 bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member))
 bot_app.add_handler(ChatMemberHandler(chat_member, ChatMemberHandler.CHAT_MEMBER))
 
+# 所有非命令消息都走主风控
 bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, guard))
 
 
