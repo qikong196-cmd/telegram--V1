@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -27,9 +27,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
             "可用指令：\n"
-            "/start\n"
-            "/help\n"
-            "/rules"
+            "/start - 启动机器人\n"
+            "/help - 查看帮助\n"
+            "/rules - 查看群规\n\n"
+            "也可以直接发送：\n"
+            "资源\n"
+            "客服"
         )
 
 
@@ -39,7 +42,8 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "群规：\n"
             "1. 禁止广告\n"
             "2. 禁止私聊拉人\n"
-            "3. 禁止刷屏"
+            "3. 禁止刷屏\n"
+            "4. 违规将处理"
         )
 
 
@@ -50,7 +54,7 @@ async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if "资源" in text:
-        await update.message.reply_text("资源入口稍后补上，你也可以先看置顶消息。")
+        await update.message.reply_text("资源入口稍后补上，你也可以先查看置顶消息。")
     elif "客服" in text:
         await update.message.reply_text("如需帮助，请联系管理员。")
 
@@ -64,7 +68,11 @@ async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE
     new_status = chat_member_update.new_chat_member.status
     user = chat_member_update.new_chat_member.user
 
-    joined = old_status in ("left", "kicked") and new_status in ("member", "administrator", "restricted")
+    joined = old_status in ("left", "kicked") and new_status in (
+        "member",
+        "administrator",
+        "restricted",
+    )
 
     if joined:
         await context.bot.send_message(
@@ -72,7 +80,8 @@ async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=(
                 f"欢迎 {user.first_name} 🔥\n\n"
                 "请先查看群规 /rules\n"
-                "发送【资源】获取内容"
+                "发送【资源】获取内容\n"
+                "发送【客服】联系管理员"
             ),
         )
 
@@ -81,7 +90,9 @@ bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
 bot_app.add_handler(CommandHandler("rules", rules))
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, keyword_reply))
-bot_app.add_handler(ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER))
+bot_app.add_handler(
+    ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER)
+)
 
 
 @app.on_event("startup")
@@ -104,7 +115,12 @@ async def shutdown():
 
 @app.get("/")
 async def home():
-    return {"ok": True}
+    return {"ok": True, "status": "running"}
+
+
+@app.head("/")
+async def home_head():
+    return Response(status_code=200)
 
 
 @app.post("/webhook")
