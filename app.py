@@ -6,6 +6,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    ChatMemberHandler,
     filters,
 )
 
@@ -18,43 +19,69 @@ app = FastAPI()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("机器人已启动 ✅")
+    if update.message:
+        await update.message.reply_text("机器人已启动 ✅")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "可用指令：\n"
-        "/start\n"
-        "/help\n"
-        "/rules"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "可用指令：\n"
+            "/start\n"
+            "/help\n"
+            "/rules"
+        )
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "群规：\n"
-        "1. 禁止广告\n"
-        "2. 禁止私聊拉人\n"
-        "3. 禁止刷屏"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "群规：\n"
+            "1. 禁止广告\n"
+            "2. 禁止私聊拉人\n"
+            "3. 禁止刷屏"
+        )
 
 
-async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.new_chat_members:
-        for user in update.message.new_chat_members:
-            await update.message.reply_text(
-                f"""欢迎 {user.first_name} 🔥
+async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
 
-请先查看群规 /rules
-发送【资源】获取内容
-"""
-            )
+    text = update.message.text.strip()
+
+    if "资源" in text:
+        await update.message.reply_text("资源入口稍后补上，你也可以先看置顶消息。")
+    elif "客服" in text:
+        await update.message.reply_text("如需帮助，请联系管理员。")
+
+
+async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_member_update = update.chat_member
+    if not chat_member_update:
+        return
+
+    old_status = chat_member_update.old_chat_member.status
+    new_status = chat_member_update.new_chat_member.status
+    user = chat_member_update.new_chat_member.user
+
+    joined = old_status in ("left", "kicked") and new_status in ("member", "administrator", "restricted")
+
+    if joined:
+        await context.bot.send_message(
+            chat_id=chat_member_update.chat.id,
+            text=(
+                f"欢迎 {user.first_name} 🔥\n\n"
+                "请先查看群规 /rules\n"
+                "发送【资源】获取内容"
+            ),
+        )
 
 
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
 bot_app.add_handler(CommandHandler("rules", rules))
-bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, keyword_reply))
+bot_app.add_handler(ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
 
 @app.on_event("startup")
