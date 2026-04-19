@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]  # 例如 @my_channel
+REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]  # 例如：@ai_r444
 
 bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 app = FastAPI()
@@ -38,7 +38,7 @@ async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
     """
     try:
         member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ("member", "administrator", "creator")
+        return member.status in ("member", "administrator", "creator", "owner")
     except Exception as e:
         logger.warning("检查频道订阅失败: %s", e)
         return False
@@ -96,6 +96,14 @@ async def unmute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id:
     )
 
 
+async def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator", "owner")
+    except Exception:
+        return False
+
+
 # ===== 指令 =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,7 +118,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/start - 启动机器人\n"
             "/help - 查看帮助\n"
             "/rules - 查看群规\n"
-            "/verify - 验证频道关注并解禁\n\n"
+            "/verify - 手动验证频道关注并解禁\n\n"
             "关键词：资源 / 客服"
         )
 
@@ -139,9 +147,7 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if subscribed:
         await unmute_user(context, chat_id, user.id)
         if update.message:
-            await update.message.reply_text(
-                f"{user.first_name} ✅ 验证成功，已解除禁言。"
-            )
+            await update.message.reply_text(f"{user.first_name} ✅ 验证成功，已解除禁言。")
     else:
         if update.message:
             await update.message.reply_text(
@@ -160,12 +166,12 @@ async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if "资源" in text:
-        await update.message.reply_text("资源入口稍后补上（这里可以换成你的链接）")
+        await update.message.reply_text("资源入口稍后补上（这里替换成你的链接）")
     elif "客服" in text:
         await update.message.reply_text("如需帮助，请联系管理员。")
 
 
-# ===== 新人欢迎 + 强制关注频道 =====
+# ===== 欢迎 =====
 
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
@@ -188,7 +194,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 f"欢迎 {user.first_name} 🔥\n\n"
                 f"请先关注频道：{REQUIRED_CHANNEL}\n"
-                "关注后发送 /verify 解禁发言。"
+                "关注后回群随便发一句话，即可自动解禁。"
             )
         else:
             await update.message.reply_text(
@@ -229,7 +235,7 @@ async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text=(
                     f"欢迎 {user.first_name} 🔥\n\n"
                     f"请先关注频道：{REQUIRED_CHANNEL}\n"
-                    "关注后发送 /verify 解禁发言。"
+                    "关注后回群随便发一句话，即可自动解禁。"
                 ),
             )
         else:
@@ -243,7 +249,7 @@ async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
 
-# ===== 未关注频道时拦截发言 =====
+# ===== 未关注频道时拦截发言 / 已关注自动解禁 =====
 
 async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or not update.effective_chat:
@@ -252,35 +258,45 @@ async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFA
     if not is_group_chat(update):
         return
 
-    # 管理员不处理
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    if user.is_bot:
+        return
+
+    if await is_admin(context, chat_id, user.id):
+        return
+
+    subscribed = await is_user_subscribed(context, user.id)
+
+    if subscribed:
+        try:
+            await unmute_user(context, chat_id, user.id)
+            await update.message.reply_text(
+                f"{user.first_name} ✅ 已检测到你已关注频道，已自动解除禁言。"
+            )
+        except Exception as e:
+            logger.warning("自动解禁失败: %s", e)
+        return
+
     try:
-        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-        if member.status in ("administrator", "creator"):
-            return
-    except Exception:
-        pass
+        await update.message.delete()
+    except Exception as e:
+        logger.warning("删除消息失败: %s", e)
 
-    subscribed = await is_user_subscribed(context, update.effective_user.id)
+    try:
+        await mute_user(context, chat_id, user.id)
+    except Exception as e:
+        logger.warning("禁言失败: %s", e)
 
-    if not subscribed:
-        try:
-            await update.message.delete()
-        except Exception as e:
-            logger.warning("删除消息失败: %s", e)
-
-        try:
-            await mute_user(context, update.effective_chat.id, update.effective_user.id)
-        except Exception as e:
-            logger.warning("禁言失败: %s", e)
-
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"{update.effective_user.first_name}，你还没有关注频道。\n"
-                f"请先加入：{REQUIRED_CHANNEL}\n"
-                "加入后发送 /verify 解禁。"
-            ),
-        )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{user.first_name} ❌ 你还没有关注频道\n"
+            f"👉 请先加入：{REQUIRED_CHANNEL}\n"
+            "加入后回群随便发一句话即可自动解禁"
+        ),
+    )
 
 
 # ===== 注册 handler =====
@@ -290,11 +306,9 @@ bot_app.add_handler(CommandHandler("help", help_command))
 bot_app.add_handler(CommandHandler("rules", rules))
 bot_app.add_handler(CommandHandler("verify", verify))
 
-# 先欢迎
 bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
 bot_app.add_handler(ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-# 再拦截未订阅用户消息
 bot_app.add_handler(
     MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
@@ -302,7 +316,6 @@ bot_app.add_handler(
     )
 )
 
-# 最后做关键词回复
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, keyword_reply))
 
 
@@ -323,7 +336,7 @@ async def startup():
     logger.info("Webhook 已设置成功")
 
 
-# ===== 关闭（不要删 webhook） =====
+# ===== 关闭 =====
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -354,6 +367,5 @@ async def telegram_webhook(request: Request):
     update = Update.de_json(data, bot_app.bot)
 
     logger.info("收到 update")
-
     await bot_app.process_update(update)
     return {"ok": True}
