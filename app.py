@@ -1,13 +1,14 @@
 import os
 import logging
 from fastapi import FastAPI, Request, Response
-from telegram import Update, ChatPermissions
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     ChatMemberHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -32,10 +33,16 @@ def is_group_chat(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type in ("group", "supergroup"))
 
 
+def get_verify_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("先去关注频道", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}")],
+            [InlineKeyboardButton("我已关注，点击解禁", callback_data="verify_subscription")],
+        ]
+    )
+
+
 async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """
-    检查用户是否已加入指定频道
-    """
     try:
         member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
         return member.status in ("member", "administrator", "creator", "owner")
@@ -45,9 +52,6 @@ async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
 
 
 async def mute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """
-    禁言用户
-    """
     await context.bot.restrict_chat_member(
         chat_id=chat_id,
         user_id=user_id,
@@ -71,9 +75,6 @@ async def mute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
 
 
 async def unmute_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """
-    解禁用户
-    """
     await context.bot.restrict_chat_member(
         chat_id=chat_id,
         user_id=user_id,
@@ -141,7 +142,6 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     chat_id = update.effective_chat.id
-
     subscribed = await is_user_subscribed(context, user.id)
 
     if subscribed:
@@ -151,10 +151,33 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if update.message:
             await update.message.reply_text(
-                "你还没有关注频道。\n\n"
-                f"请先加入频道：{REQUIRED_CHANNEL}\n"
-                "加入后再发送 /verify"
+                f"你还没有关注频道：{REQUIRED_CHANNEL}\n"
+                "请先关注，再发送 /verify",
+                reply_markup=get_verify_keyboard(),
             )
+
+
+# ===== 按钮验证 =====
+
+async def verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+    chat = query.message.chat if query.message else None
+    if not chat:
+        return
+
+    subscribed = await is_user_subscribed(context, user.id)
+
+    if subscribed:
+        await unmute_user(context, chat.id, user.id)
+        await query.message.reply_text(f"{user.first_name} ✅ 已确认关注频道，已解除禁言。")
+    else:
+        await query.answer("你还没有关注频道，请先关注后再点。", show_alert=True)
 
 
 # ===== 关键词回复 =====
@@ -173,6 +196,35 @@ async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== 欢迎 =====
 
+async def send_welcome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user):
+    subscribed = await is_user_subscribed(context, user.id)
+
+    if not subscribed:
+        try:
+            await mute_user(context, chat_id, user.id)
+        except Exception as e:
+            logger.warning("禁言失败: %s", e)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"欢迎 {user.first_name} 🔥\n\n"
+                f"请先关注频道：{REQUIRED_CHANNEL}\n"
+                "关注后点击下方按钮即可自动解禁。"
+            ),
+            reply_markup=get_verify_keyboard(),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"欢迎 {user.first_name} 🔥\n\n"
+                "你已通过频道检查，可以正常发言。\n"
+                "请先查看群规 /rules"
+            ),
+        )
+
+
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
         return
@@ -182,26 +234,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     for user in update.message.new_chat_members:
         if user.is_bot:
             continue
-
-        subscribed = await is_user_subscribed(context, user.id)
-
-        if not subscribed:
-            try:
-                await mute_user(context, update.effective_chat.id, user.id)
-            except Exception as e:
-                logger.warning("禁言失败: %s", e)
-
-            await update.message.reply_text(
-                f"欢迎 {user.first_name} 🔥\n\n"
-                f"请先关注频道：{REQUIRED_CHANNEL}\n"
-                "关注后回群随便发一句话，即可自动解禁。"
-            )
-        else:
-            await update.message.reply_text(
-                f"欢迎 {user.first_name} 🔥\n\n"
-                "你已通过频道检查，可以正常发言。\n"
-                "请先查看群规 /rules"
-            )
+        await send_welcome(context, update.effective_chat.id, user)
 
 
 async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -222,34 +255,10 @@ async def welcome_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     if joined and not user.is_bot:
-        subscribed = await is_user_subscribed(context, user.id)
-
-        if not subscribed:
-            try:
-                await mute_user(context, chat_id, user.id)
-            except Exception as e:
-                logger.warning("禁言失败: %s", e)
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"欢迎 {user.first_name} 🔥\n\n"
-                    f"请先关注频道：{REQUIRED_CHANNEL}\n"
-                    "关注后回群随便发一句话，即可自动解禁。"
-                ),
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"欢迎 {user.first_name} 🔥\n\n"
-                    "你已通过频道检查，可以正常发言。\n"
-                    "请先查看群规 /rules"
-                ),
-            )
+        await send_welcome(context, chat_id, user)
 
 
-# ===== 未关注频道时拦截发言 / 已关注自动解禁 =====
+# ===== 未关注频道时拦截发言 =====
 
 async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or not update.effective_chat:
@@ -270,13 +279,6 @@ async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFA
     subscribed = await is_user_subscribed(context, user.id)
 
     if subscribed:
-        try:
-            await unmute_user(context, chat_id, user.id)
-            await update.message.reply_text(
-                f"{user.first_name} ✅ 已检测到你已关注频道，已自动解除禁言。"
-            )
-        except Exception as e:
-            logger.warning("自动解禁失败: %s", e)
         return
 
     try:
@@ -294,8 +296,9 @@ async def block_unsubscribed_messages(update: Update, context: ContextTypes.DEFA
         text=(
             f"{user.first_name} ❌ 你还没有关注频道\n"
             f"👉 请先加入：{REQUIRED_CHANNEL}\n"
-            "加入后回群随便发一句话即可自动解禁"
+            "关注后点击按钮即可自动解禁"
         ),
+        reply_markup=get_verify_keyboard(),
     )
 
 
@@ -305,6 +308,8 @@ bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
 bot_app.add_handler(CommandHandler("rules", rules))
 bot_app.add_handler(CommandHandler("verify", verify))
+
+bot_app.add_handler(CallbackQueryHandler(verify_button, pattern="^verify_subscription$"))
 
 bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
 bot_app.add_handler(ChatMemberHandler(welcome_chat_member, ChatMemberHandler.CHAT_MEMBER))
