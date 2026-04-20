@@ -33,7 +33,6 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 REQUIRED_CHANNEL = os.environ["REQUIRED_CHANNEL"]  # 例如 @ai_r444
 
 # 黑名单关键词：英文逗号分隔
-# 例如：菠菜,兼职,日结,担保,代付,外围,送彩金,客服飞机
 BLACKLIST_KEYWORDS = [
     x.strip().lower()
     for x in os.environ.get("BLACKLIST_KEYWORDS", "").split(",")
@@ -41,7 +40,6 @@ BLACKLIST_KEYWORDS = [
 ]
 
 # 白名单用户ID：英文逗号分隔
-# 例如：123456789,987654321
 WHITELIST_USER_IDS = {
     int(x.strip())
     for x in os.environ.get("WHITELIST_USER_IDS", "").split(",")
@@ -49,9 +47,9 @@ WHITELIST_USER_IDS = {
 }
 
 # 防刷配置
-RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))       # 时间窗内最多消息数
-RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))    # 时间窗秒数
-FLOOD_MUTE_SECONDS = int(os.environ.get("FLOOD_MUTE_SECONDS", "300")) # 超频禁言秒数
+RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "5"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "10"))
+FLOOD_MUTE_SECONDS = int(os.environ.get("FLOOD_MUTE_SECONDS", "300"))
 
 bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 app = FastAPI()
@@ -88,12 +86,10 @@ def contains_ad_keywords(text: str) -> bool:
     if not text:
         return False
 
-    # 自定义黑词
     for kw in BLACKLIST_KEYWORDS:
         if kw and kw in text:
             return True
 
-    # 内置常见广告/引流模式
     common_spam_patterns = [
         "http://", "https://", "t.me/", "@",
         "wx", "vx", "飞机", "电报联系",
@@ -121,15 +117,27 @@ async def safe_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: 
         pass
 
 
-async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, seconds: int = 5):
+async def delete_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    msg_id: int,
+    seconds: int = 5,
+):
     await asyncio.sleep(seconds)
     await safe_delete(context, chat_id, msg_id)
 
 
-async def send_temp_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, seconds: int = 5):
+async def send_temp_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    seconds: int = 5,
+):
     try:
         msg = await context.bot.send_message(chat_id, text)
-        context.application.create_task(delete_later(context, chat_id, msg.message_id, seconds))
+        context.application.create_task(
+            delete_later(context, chat_id, msg.message_id, seconds)
+        )
     except Exception:
         pass
 
@@ -151,7 +159,12 @@ async def mute(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int):
     )
 
 
-async def mute_for_seconds(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int, seconds: int):
+async def mute_for_seconds(
+    context: ContextTypes.DEFAULT_TYPE,
+    cid: int,
+    uid: int,
+    seconds: int,
+):
     until_date = int(time.time()) + seconds
     await context.bot.restrict_chat_member(
         cid,
@@ -182,7 +195,6 @@ async def is_admin(context: ContextTypes.DEFAULT_TYPE, cid: int, uid: int) -> bo
 
 
 async def send_verify(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
-    # 删除旧验证消息，只保留一条
     for mid in VERIFY_MSG[(cid, user.id)]:
         await safe_delete(context, cid, mid)
     VERIFY_MSG[(cid, user.id)].clear()
@@ -275,11 +287,9 @@ async def handle_new_user(context: ContextTypes.DEFAULT_TYPE, cid: int, user):
     if is_whitelisted(user.id):
         return
 
-    # 已在频道中，不处理
     if await is_sub(context, user.id):
         return
 
-    # 未关注：先禁言，再发验证
     await mute(context, cid, user.id)
     await send_verify(context, cid, user)
 
@@ -288,7 +298,6 @@ async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    # 删掉 Telegram 的入群系统消息
     try:
         await update.message.delete()
     except Exception:
@@ -307,7 +316,6 @@ async def chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.chat_member.new_chat_member.user
     cid = update.chat_member.chat.id
 
-    # 新成员加入
     if old_status in ("left", "kicked") and new_status in ("member", "restricted", "administrator"):
         await handle_new_user(context, cid, user)
 
@@ -315,6 +323,10 @@ async def chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== 主风控：公开入口补漏 + 广告 + 防刷 =====
 
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 跳过频道自动转发消息 / 频道身份发言
+    if update.message and update.message.sender_chat:
+        return
+
     if not update.message or not update.effective_user or not update.effective_chat:
         return
 
@@ -330,7 +342,7 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_admin(context, cid, user.id):
         return
 
-    # 1. 发言触发强制频道验证（补公开群入口的漏）
+    # 发言触发强制频道验证（补公开入口的漏）
     if not await is_sub(context, user.id):
         try:
             await update.message.delete()
@@ -344,7 +356,7 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 用户已关注频道，清理旧验证消息
     await clear_verify(context, cid, user.id)
 
-    # 2. 防广告
+    # 防广告
     text = get_message_text(update)
     if contains_ad_keywords(text):
         try:
@@ -360,7 +372,7 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_temp_text(context, cid, "已处理违规广告账号。", 5)
         return
 
-    # 3. 防刷屏
+    # 防刷屏
     if hit_rate_limit(cid, user.id):
         try:
             await update.message.delete()
